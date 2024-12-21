@@ -1,0 +1,4 @@
+Error: Maelstrom input from STDIN could not be deserialized
+
+Caused by:
+    unknown variant `init`, expected `echo` or `echo_ok` at line 1 column 97
