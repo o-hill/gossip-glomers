@@ -1,7 +1,7 @@
 use std::io::{StdoutLock, Write};
 
 use anyhow::Context;
-use gjengset_fly_io::{main_loop, Message, Node};
+use gjengset_fly_io::{main_loop, Event, Node};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -17,14 +17,21 @@ pub struct EchoNode {
 }
 
 impl Node<(), Payload> for EchoNode {
-    fn from_init(_state: (), _init: gjengset_fly_io::Init) -> anyhow::Result<Self>
+    fn from_init(
+        _state: (),
+        _init: gjengset_fly_io::Init,
+        _tx: std::sync::mpsc::Sender<Event<Payload>>,
+    ) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
         Ok(EchoNode { id: 1 })
     }
 
-    fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+    fn step(&mut self, input: Event<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
+        let Event::Message(input) = input else {
+            panic!("got injected event in echo");
+        };
         let mut reply = input.into_reply(Some(&mut self.id));
 
         match reply.body.payload {
@@ -42,5 +49,5 @@ impl Node<(), Payload> for EchoNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<_, EchoNode, _>(())
+    main_loop::<_, EchoNode, _, _>(())
 }
