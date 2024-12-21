@@ -8,41 +8,46 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum Payload {
-    Echo { echo: String },
-    EchoOk { echo: String },
+    Generate,
+    GenerateOk { id: String },
 }
 
-pub struct EchoNode {
+pub struct UniqueIdNode {
+    node: String,
     id: usize,
 }
 
-impl Node<(), Payload> for EchoNode {
-    fn from_init(_state: (), _init: gjengset_fly_io::Init) -> anyhow::Result<Self>
+impl Node<(), Payload> for UniqueIdNode {
+    fn from_init(_state: (), init: gjengset_fly_io::Init) -> anyhow::Result<Self>
     where
         Self: Sized,
     {
-        Ok(EchoNode { id: 1 })
+        Ok(UniqueIdNode {
+            node: init.node_id,
+            id: 1,
+        })
     }
 
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
         match input.body.payload {
-            Payload::Echo { echo } => {
+            Payload::Generate => {
+                let guid = format!("{}-{}", self.node, self.id);
                 let reply = Message {
                     src: input.dst,
                     dst: input.src,
                     body: Body {
                         id: Some(self.id),
                         in_reply_to: input.body.id,
-                        payload: Payload::EchoOk { echo },
+                        payload: Payload::GenerateOk { id: guid },
                     },
                 };
 
                 serde_json::to_writer(&mut *output, &reply)
-                    .context("serialize response to init")?;
+                    .context("serialize response to generate")?;
                 output.write_all(b"\n").context("write trailing newline")?;
                 self.id += 1;
             }
-            Payload::EchoOk { .. } => {}
+            Payload::GenerateOk { .. } => {}
         }
 
         Ok(())
@@ -50,5 +55,5 @@ impl Node<(), Payload> for EchoNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    main_loop::<_, EchoNode, _>(())
+    main_loop::<_, UniqueIdNode, _>(())
 }
