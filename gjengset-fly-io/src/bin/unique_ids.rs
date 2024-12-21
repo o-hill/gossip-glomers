@@ -1,7 +1,7 @@
 use std::io::{StdoutLock, Write};
 
 use anyhow::Context;
-use gjengset_fly_io::{main_loop, Body, Message, Node};
+use gjengset_fly_io::{main_loop, Message, Node};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -29,23 +29,14 @@ impl Node<(), Payload> for UniqueIdNode {
     }
 
     fn step(&mut self, input: Message<Payload>, output: &mut StdoutLock) -> anyhow::Result<()> {
-        match input.body.payload {
+        let mut reply = input.into_reply(Some(&mut self.id));
+        match reply.body.payload {
             Payload::Generate => {
                 let guid = format!("{}-{}", self.node, self.id);
-                let reply = Message {
-                    src: input.dst,
-                    dst: input.src,
-                    body: Body {
-                        id: Some(self.id),
-                        in_reply_to: input.body.id,
-                        payload: Payload::GenerateOk { id: guid },
-                    },
-                };
-
+                reply.body.payload = Payload::GenerateOk { id: guid };
                 serde_json::to_writer(&mut *output, &reply)
                     .context("serialize response to generate")?;
                 output.write_all(b"\n").context("write trailing newline")?;
-                self.id += 1;
             }
             Payload::GenerateOk { .. } => {}
         }
