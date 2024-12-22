@@ -54,7 +54,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
     {
         std::thread::spawn(move || loop {
             // TODO: handle EOF event.
-            std::thread::sleep(Duration::from_millis(250));
+            std::thread::sleep(Duration::from_millis(400));
             if let Err(_) = tx.send(Event::Injected(InjectedPayload::Gossip)) {
                 break;
             }
