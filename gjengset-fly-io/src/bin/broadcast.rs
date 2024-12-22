@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Context;
 use gjengset_fly_io::{main_loop, Body, Event, Message, Node};
-use rand::prelude::*;
+use rand::{seq::SliceRandom, Rng};
 use serde::{Deserialize, Serialize};
 
 enum InjectedPayload {
@@ -54,11 +54,16 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
     {
         std::thread::spawn(move || loop {
             // TODO: handle EOF event.
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(Duration::from_millis(250));
             if let Err(_) = tx.send(Event::Injected(InjectedPayload::Gossip)) {
                 break;
             }
         });
+
+        let mut nodes = init.node_ids.clone();
+        nodes.shuffle(&mut rand::thread_rng());
+        let neighbor_count = (nodes.len() / 2) + 1;
+        let neighbors = nodes[..neighbor_count].to_vec();
 
         Ok(BroadcastNode {
             node: init.node_id,
@@ -69,7 +74,7 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                 .into_iter()
                 .map(|nid| (nid, HashSet::new()))
                 .collect(),
-            neighborhood: Vec::new(),
+            neighborhood: neighbors,
             msg_communicated: HashMap::new(),
         })
     }
@@ -137,10 +142,10 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                         };
                         reply.send(&mut *output).context("reply to read")?;
                     }
-                    Payload::Topology { mut topology } => {
-                        self.neighborhood = topology
-                            .remove(&self.node)
-                            .unwrap_or_else(|| panic!("no topology for node {}", self.node));
+                    Payload::Topology { topology: _ } => {
+                        // self.neighborhood = topology
+                        //     .remove(&self.node)
+                        //     .unwrap_or_else(|| panic!("no topology for node {}", self.node));
 
                         reply.body.payload = Payload::TopologyOk;
                         reply.send(&mut *output).context("reply to topology")?;
