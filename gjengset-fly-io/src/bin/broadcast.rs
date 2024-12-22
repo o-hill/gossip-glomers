@@ -1,11 +1,12 @@
 use std::{
     collections::{HashMap, HashSet},
-    io::{StdoutLock, Write},
+    io::StdoutLock,
     time::Duration,
 };
 
 use anyhow::Context;
 use gjengset_fly_io::{main_loop, Body, Event, Message, Node};
+use rand::prelude::*;
 use serde::{Deserialize, Serialize};
 
 enum InjectedPayload {
@@ -83,20 +84,29 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                 InjectedPayload::Gossip => {
                     for n in &self.neighborhood {
                         let known_to_n = &self.known[n];
+                        let (already_known, mut notify_of): (HashSet<_>, HashSet<_>) = self
+                            .messages
+                            .iter()
+                            .copied()
+                            .partition(|m| known_to_n.contains(m));
+
+                        eprintln!("notify of {}/{}", notify_of.len(), self.messages.len());
+
+                        notify_of.extend(
+                            already_known
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(i, m)| if i < 10 { Some(m) } else { None })
+                                .collect::<HashSet<_>>(),
+                        );
+
                         Message {
                             src: self.node.clone(),
                             dst: n.clone(),
                             body: Body {
                                 id: None,
                                 in_reply_to: None,
-                                payload: Payload::Gossip {
-                                    seen: self
-                                        .messages
-                                        .iter()
-                                        .filter(|m| !known_to_n.contains(m))
-                                        .copied()
-                                        .collect(),
-                                },
+                                payload: Payload::Gossip { seen: notify_of },
                             },
                         }
                         .send(&mut *output)
@@ -109,6 +119,11 @@ impl Node<(), Payload, InjectedPayload> for BroadcastNode {
                 let mut reply = input.into_reply(Some(&mut self.id));
                 match reply.body.payload {
                     Payload::Gossip { seen } => {
+                        self.known
+                            .get_mut(&reply.dst)
+                            .expect("got gossip from unknown node")
+                            .extend(seen.iter().copied());
+
                         self.messages.extend(seen);
                     }
                     Payload::Broadcast { message } => {
