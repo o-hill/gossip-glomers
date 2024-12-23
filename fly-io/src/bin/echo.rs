@@ -14,15 +14,22 @@ pub struct EchoNode {
 }
 
 impl fly_io::Node<EchoPayload> for EchoNode {
-    fn from_init(_init: fly_io::Init) -> Self {
+    fn from_init(
+        _init: fly_io::Init,
+        _tx: std::sync::mpsc::Sender<fly_io::Event<EchoPayload>>,
+    ) -> Self {
         EchoNode { id: 1 }
     }
 
     fn step(
         &mut self,
-        input: fly_io::Message<EchoPayload>,
+        input: fly_io::Event<EchoPayload>,
         mut output: &mut impl std::io::Write,
     ) -> anyhow::Result<()> {
+        let fly_io::Event::Message(input) = input else {
+            panic!("Echo node received a non-message event");
+        };
+
         let mut reply = input.into_reply(Some(&mut self.id));
         match reply.body.payload {
             EchoPayload::Echo { echo } => {
@@ -36,5 +43,5 @@ impl fly_io::Node<EchoPayload> for EchoNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    fly_io::run::<EchoPayload, EchoNode>()
+    fly_io::run::<EchoPayload, (), EchoNode>()
 }

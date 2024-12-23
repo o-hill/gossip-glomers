@@ -64,7 +64,7 @@ impl<P> Message<P> {
         }
     }
 
-    pub fn send(&self, mut output: &mut impl Write) -> anyhow::Result<()>
+    pub fn send(&self, output: &mut impl Write) -> anyhow::Result<()>
     where
         P: Serialize,
     {
