@@ -4,10 +4,11 @@ use std::{
 };
 
 use anyhow::Context;
-use fly_io::Message;
+use fly_io::protocol::{Body, Message};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone)]
 enum InjectedPayload {
     Gossip,
 }
@@ -35,15 +36,15 @@ enum BroadcastPayload {
 
 struct BroadcastNode {
     node_id: String,
-    id: usize,
     messages: HashSet<usize>,
     neighborhood: Vec<String>,
     known: HashMap<String, HashSet<usize>>,
 }
 
+#[async_trait::async_trait]
 impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
     fn from_init(
-        init: fly_io::Init,
+        init: fly_io::protocol::Init,
         tx: std::sync::mpsc::Sender<fly_io::Event<BroadcastPayload, InjectedPayload>>,
     ) -> Self {
         std::thread::spawn(move || loop {
@@ -63,7 +64,6 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
 
         Self {
             node_id: init.node_id,
-            id: 1,
             messages: HashSet::new(),
             neighborhood,
             known: init
@@ -74,10 +74,10 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
         }
     }
 
-    fn step(
+    async fn step(
         &mut self,
         input: fly_io::Event<BroadcastPayload, InjectedPayload>,
-        mut output: &mut impl std::io::Write,
+        network: &mut fly_io::server::Network<BroadcastPayload, InjectedPayload>,
     ) -> anyhow::Result<()> {
         match input {
             fly_io::Event::Injected(event) => match event {
@@ -101,20 +101,20 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
                         let message = Message {
                             src: self.node_id.clone(),
                             dst: neighbor.clone(),
-                            body: fly_io::Body {
+                            body: Body {
                                 id: None,
                                 in_reply_to: None,
                                 payload: BroadcastPayload::Gossip { seen: notify_of },
                             },
                         };
-                        message
-                            .send(&mut output)
+                        network
+                            .send(message)
                             .context(format!("gossip to {}", neighbor))?;
                     }
                 }
             },
             fly_io::Event::Message(input) => {
-                let mut reply = input.into_reply(Some(&mut self.id));
+                let mut reply = input.into_reply();
                 match reply.body.payload {
                     BroadcastPayload::Gossip { seen } => {
                         self.known
@@ -127,21 +127,21 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
                     BroadcastPayload::Broadcast { message } => {
                         self.messages.insert(message);
                         reply.body.payload = BroadcastPayload::BroadcastOk;
-                        reply.send(&mut output).context("sending broadcast reply")?;
+                        network.send(reply).context("sending broadcast reply")?;
                     }
                     BroadcastPayload::Read => {
                         reply.body.payload = BroadcastPayload::ReadOk {
                             messages: self.messages.clone(),
                         };
-                        reply.send(&mut output).context("sending read reply")?;
+                        network.send(reply).context("sending read reply")?;
                     }
-                    BroadcastPayload::Topology { mut topology } => {
+                    BroadcastPayload::Topology { topology: _ } => {
                         // self.neighborhood = topology
                         //     .remove(&self.node_id)
                         //     .unwrap_or_else(|| panic!("node not in topology {}", self.node_id));
 
                         reply.body.payload = BroadcastPayload::TopologyOk;
-                        reply.send(&mut output).context("sending topology reply")?;
+                        network.send(reply).context("sending topology reply")?;
                     }
                     BroadcastPayload::BroadcastOk => {}
                     BroadcastPayload::ReadOk { .. } => {}
@@ -155,5 +155,5 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    fly_io::run::<BroadcastPayload, InjectedPayload, BroadcastNode>()
+    fly_io::server::Server::<BroadcastPayload, InjectedPayload>::new().serve::<BroadcastNode>()
 }

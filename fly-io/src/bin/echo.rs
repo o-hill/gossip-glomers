@@ -9,32 +9,31 @@ pub enum EchoPayload {
     EchoOk { echo: String },
 }
 
-pub struct EchoNode {
-    id: usize,
-}
+pub struct EchoNode {}
 
+#[async_trait::async_trait]
 impl fly_io::Node<EchoPayload> for EchoNode {
     fn from_init(
-        _init: fly_io::Init,
+        _init: fly_io::protocol::Init,
         _tx: std::sync::mpsc::Sender<fly_io::Event<EchoPayload>>,
     ) -> Self {
-        EchoNode { id: 1 }
+        EchoNode {}
     }
 
-    fn step(
+    async fn step(
         &mut self,
         input: fly_io::Event<EchoPayload>,
-        mut output: &mut impl std::io::Write,
+        network: &mut fly_io::server::Network<EchoPayload>,
     ) -> anyhow::Result<()> {
         let fly_io::Event::Message(input) = input else {
             panic!("Echo node received a non-message event");
         };
 
-        let mut reply = input.into_reply(Some(&mut self.id));
+        let mut reply = input.into_reply();
         match reply.body.payload {
             EchoPayload::Echo { echo } => {
                 reply.body.payload = EchoPayload::EchoOk { echo };
-                reply.send(&mut output).context("sending echo_ok message")?;
+                network.send(reply).context("sending echo_ok message")?;
             }
             EchoPayload::EchoOk { .. } => {}
         }
@@ -43,5 +42,5 @@ impl fly_io::Node<EchoPayload> for EchoNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    fly_io::run::<EchoPayload, (), EchoNode>()
+    fly_io::server::Server::<EchoPayload, ()>::new().serve::<EchoNode>()
 }
