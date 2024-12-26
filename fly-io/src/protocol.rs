@@ -46,12 +46,12 @@ impl<P> Message<P> {
         }
     }
 
-    pub fn send(&self, output: &mut impl std::io::Write) -> anyhow::Result<()>
+    pub fn send(&self) -> anyhow::Result<()>
     where
         P: Serialize,
     {
-        serde_json::to_writer(&mut *output, self).context("serialize message to stdout")?;
-        output.write_all(b"\n").context("write trailing newline")?;
+        let message = serde_json::to_string(self).context("serialize message to stdout")?;
+        println!("{}", message);
         Ok(())
     }
 }

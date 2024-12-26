@@ -1,6 +1,13 @@
-use std::time::Duration;
+use std::{
+    sync::{Arc, RwLock},
+    time::Duration,
+};
 
-use anyhow::Context;
+use anyhow::{anyhow, Context};
+use fly_io::{
+    protocol::{Body, Message},
+    Event,
+};
 use serde::{Deserialize, Serialize};
 
 pub struct SequentialStore;
@@ -11,6 +18,26 @@ impl SequentialStore {
 
     fn key() -> String {
         "value".to_string()
+    }
+
+    fn read_current_value() -> SequentialStorePayload {
+        SequentialStorePayload::Read { key: Self::key() }
+    }
+
+    fn compare_and_store(from: usize, to: usize) -> SequentialStorePayload {
+        SequentialStorePayload::Cas {
+            key: Self::key(),
+            from,
+            to,
+            create_if_not_exists: Some(true),
+        }
+    }
+
+    fn write(value: usize) -> SequentialStorePayload {
+        SequentialStorePayload::Write {
+            key: Self::key(),
+            value,
+        }
     }
 }
 
@@ -47,23 +74,65 @@ enum CounterPayload {
     Read,
     ReadOk { value: usize },
     CasOk,
+    WriteOk,
 }
 
+#[derive(Clone)]
 enum InjectedPayload {
     ReadFromStore,
 }
 
+#[derive(Debug, Clone)]
 struct CounterNode {
     node_id: String,
-    id: usize,
-    value: usize,
+    value: Arc<RwLock<usize>>,
 }
 
+impl CounterNode {
+    fn construct_message<P>(&self, dst: String, payload: P) -> Message<P> {
+        Message {
+            src: self.node_id.clone(),
+            dst,
+            body: Body {
+                id: None,
+                in_reply_to: None,
+                payload,
+            },
+        }
+    }
+
+    async fn read_current_value(
+        &self,
+        network: &mut fly_io::network::Network<CounterPayload, InjectedPayload>,
+    ) -> anyhow::Result<usize> {
+        let event = network
+            .request(self.construct_message(
+                SequentialStore::address(),
+                SequentialStore::read_current_value(),
+            ))
+            .await
+            .context("fetching current value")?;
+
+        let Event::Message(message) = event else {
+            return Err(anyhow!("value request event response was not a message"));
+        };
+
+        let CounterPayload::ReadOk { value } = message.body.payload else {
+            return Err(anyhow!("value request message response was not ReadOk"));
+        };
+
+        Ok(value)
+    }
+}
+
+#[async_trait::async_trait]
 impl fly_io::Node<CounterPayload, InjectedPayload> for CounterNode {
     fn from_init(
-        init: fly_io::Init,
+        init: fly_io::protocol::Init,
         tx: std::sync::mpsc::Sender<fly_io::Event<CounterPayload, InjectedPayload>>,
+        network: &mut fly_io::network::Network<CounterPayload, InjectedPayload>,
     ) -> Self {
+        eprintln!("INITIALIZING");
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(300));
             if tx
@@ -74,56 +143,65 @@ impl fly_io::Node<CounterPayload, InjectedPayload> for CounterNode {
             }
         });
 
-        Self {
+        let result = Self {
             node_id: init.node_id,
-            id: 0,
-            value: 0,
-        }
+            value: Arc::new(RwLock::new(0)),
+        };
+
+        network
+            .send(result.construct_message(SequentialStore::address(), SequentialStore::write(0)))
+            .expect("failed to write initial value");
+
+        eprintln!("SENT WRITE");
+
+        result
     }
 
-    fn step(
+    async fn step(
         &mut self,
         event: fly_io::Event<CounterPayload, InjectedPayload>,
-        mut output: &mut impl std::io::Write,
+        network: &mut fly_io::network::Network<CounterPayload, InjectedPayload>,
     ) -> anyhow::Result<()> {
         match event {
             fly_io::Event::Injected(payload) => match payload {
                 InjectedPayload::ReadFromStore => {}
             },
             fly_io::Event::Message(message) => {
-                let mut reply = message.into_reply(Some(&mut self.id));
+                let mut reply = message.into_reply();
                 match reply.body.payload {
                     CounterPayload::Add { delta } => {
-                        let add = fly_io::Message {
-                            src: self.node_id.clone(),
-                            dst: SequentialStore::address(),
-                            body: fly_io::Body {
-                                id: None,
-                                in_reply_to: None,
-                                payload: SequentialStorePayload::Cas {
-                                    key: SequentialStore::key(),
-                                    from: self.value,
-                                    to: new,
-                                    create_if_not_exists: Some(true),
-                                },
-                            },
-                        };
-                        add.send(&mut output).context("sending add to seq-kv")?;
-                        self.value = new;
+                        eprintln!("GETTING CURRENT VALUE");
+                        let current_value = self
+                            .read_current_value(network)
+                            .await
+                            .context("reading current value from add")?;
+
+                        let new_value = current_value + delta;
+                        network
+                            .send(self.construct_message(
+                                SequentialStore::address(),
+                                SequentialStore::compare_and_store(current_value, new_value),
+                            ))
+                            .context("adding delta")?;
+
                         reply.body.payload = CounterPayload::AddOk;
-                        reply.send(&mut output).context("replying to add")?;
+                        network.send(reply).context("sending add_ok reply")?;
                     }
                     CounterPayload::Read => {
-                        reply.body.payload = CounterPayload::ReadOk { value: self.value };
-                        reply.send(&mut output).context("sending read reply")?;
+                        eprintln!("READING");
+                        let value = self
+                            .read_current_value(network)
+                            .await
+                            .context("reading current value from read")?;
+
+                        reply.body.payload = CounterPayload::ReadOk { value };
+                        network.send(reply).context("sending read reply")?;
+                        eprintln!("HAVE READ");
                     }
                     CounterPayload::AddOk => {}
-                    CounterPayload::ReadOk { value } => {
-                        if reply.dst == SequentialStore::address() {
-                            self.value = value;
-                        }
-                    }
+                    CounterPayload::ReadOk { .. } => {}
                     CounterPayload::CasOk => {}
+                    CounterPayload::WriteOk => {}
                 }
             }
         }
@@ -133,5 +211,5 @@ impl fly_io::Node<CounterPayload, InjectedPayload> for CounterNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    fly_io::run::<CounterPayload, InjectedPayload, CounterNode>()
+    fly_io::server::Server::<CounterPayload, InjectedPayload>::new().serve::<CounterNode>()
 }

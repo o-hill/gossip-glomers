@@ -1,6 +1,6 @@
 use protocol::Message;
-use serde::de::DeserializeOwned;
 
+pub mod network;
 pub mod protocol;
 pub mod server;
 
@@ -19,10 +19,11 @@ where
     fn from_init(
         init: crate::protocol::Init,
         tx: std::sync::mpsc::Sender<Event<Payload, InjectedPayload>>,
+        network: &mut crate::network::Network<Payload, InjectedPayload>,
     ) -> Self;
     async fn step(
         &mut self,
         event: Event<Payload, InjectedPayload>,
-        network: &mut crate::server::Network<Payload, InjectedPayload>,
+        network: &mut crate::network::Network<Payload, InjectedPayload>,
     ) -> anyhow::Result<()>;
 }

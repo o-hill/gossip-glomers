@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    sync::{Arc, RwLock},
     time::Duration,
 };
 
@@ -34,11 +35,12 @@ enum BroadcastPayload {
     TopologyOk,
 }
 
+#[derive(Clone, Debug)]
 struct BroadcastNode {
     node_id: String,
-    messages: HashSet<usize>,
+    messages: Arc<RwLock<HashSet<usize>>>,
     neighborhood: Vec<String>,
-    known: HashMap<String, HashSet<usize>>,
+    known: Arc<RwLock<HashMap<String, HashSet<usize>>>>,
 }
 
 #[async_trait::async_trait]
@@ -46,6 +48,7 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
     fn from_init(
         init: fly_io::protocol::Init,
         tx: std::sync::mpsc::Sender<fly_io::Event<BroadcastPayload, InjectedPayload>>,
+        _network: &mut fly_io::network::Network<BroadcastPayload, InjectedPayload>,
     ) -> Self {
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(450));
@@ -64,28 +67,30 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
 
         Self {
             node_id: init.node_id,
-            messages: HashSet::new(),
+            messages: Arc::new(RwLock::new(HashSet::new())),
             neighborhood,
-            known: init
-                .node_ids
-                .into_iter()
-                .map(|id| (id, HashSet::new()))
-                .collect(),
+            known: Arc::new(RwLock::new(
+                init.node_ids
+                    .into_iter()
+                    .map(|id| (id, HashSet::new()))
+                    .collect(),
+            )),
         }
     }
 
     async fn step(
         &mut self,
         input: fly_io::Event<BroadcastPayload, InjectedPayload>,
-        network: &mut fly_io::server::Network<BroadcastPayload, InjectedPayload>,
+        network: &mut fly_io::network::Network<BroadcastPayload, InjectedPayload>,
     ) -> anyhow::Result<()> {
         match input {
             fly_io::Event::Injected(event) => match event {
                 InjectedPayload::Gossip => {
                     for neighbor in &self.neighborhood {
-                        let known_to_neighbor = &self.known[neighbor];
-                        let (already_known, mut notify_of): (HashSet<_>, HashSet<_>) = self
-                            .messages
+                        let known = self.known.read().unwrap();
+                        let messages = self.messages.read().unwrap();
+                        let known_to_neighbor = &known[neighbor];
+                        let (already_known, mut notify_of): (HashSet<_>, HashSet<_>) = messages
                             .iter()
                             .copied()
                             .partition(|m| known_to_neighbor.contains(m));
@@ -117,22 +122,24 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
                 let mut reply = input.into_reply();
                 match reply.body.payload {
                     BroadcastPayload::Gossip { seen } => {
-                        self.known
+                        let mut known = self.known.write().unwrap();
+                        let mut messages = self.messages.write().unwrap();
+                        known
                             .get_mut(&reply.dst)
                             .unwrap_or_else(|| panic!("sender {} not in known nodes", reply.dst))
                             .extend(seen.clone());
 
-                        self.messages.extend(seen);
+                        messages.extend(seen);
                     }
                     BroadcastPayload::Broadcast { message } => {
-                        self.messages.insert(message);
+                        let mut messages = self.messages.write().unwrap();
+                        messages.insert(message);
                         reply.body.payload = BroadcastPayload::BroadcastOk;
                         network.send(reply).context("sending broadcast reply")?;
                     }
                     BroadcastPayload::Read => {
-                        reply.body.payload = BroadcastPayload::ReadOk {
-                            messages: self.messages.clone(),
-                        };
+                        let messages = self.messages.read().unwrap().clone();
+                        reply.body.payload = BroadcastPayload::ReadOk { messages };
                         network.send(reply).context("sending read reply")?;
                     }
                     BroadcastPayload::Topology { topology: _ } => {

@@ -9,6 +9,7 @@ pub enum EchoPayload {
     EchoOk { echo: String },
 }
 
+#[derive(Clone, Debug)]
 pub struct EchoNode {}
 
 #[async_trait::async_trait]
@@ -16,6 +17,7 @@ impl fly_io::Node<EchoPayload> for EchoNode {
     fn from_init(
         _init: fly_io::protocol::Init,
         _tx: std::sync::mpsc::Sender<fly_io::Event<EchoPayload>>,
+        _network: &mut fly_io::network::Network<EchoPayload>,
     ) -> Self {
         EchoNode {}
     }
@@ -23,7 +25,7 @@ impl fly_io::Node<EchoPayload> for EchoNode {
     async fn step(
         &mut self,
         input: fly_io::Event<EchoPayload>,
-        network: &mut fly_io::server::Network<EchoPayload>,
+        network: &mut fly_io::network::Network<EchoPayload>,
     ) -> anyhow::Result<()> {
         let fly_io::Event::Message(input) = input else {
             panic!("Echo node received a non-message event");
