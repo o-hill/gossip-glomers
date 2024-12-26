@@ -75,6 +75,7 @@ enum CounterPayload {
     ReadOk { value: usize },
     CasOk,
     WriteOk,
+    Error { code: usize, text: String },
 }
 
 #[derive(Clone)]
@@ -85,7 +86,6 @@ enum InjectedPayload {
 #[derive(Debug, Clone)]
 struct CounterNode {
     node_id: String,
-    value: Arc<RwLock<usize>>,
 }
 
 impl CounterNode {
@@ -132,7 +132,6 @@ impl fly_io::Node<CounterPayload, InjectedPayload> for CounterNode {
         tx: std::sync::mpsc::Sender<fly_io::Event<CounterPayload, InjectedPayload>>,
         network: &mut fly_io::network::Network<CounterPayload, InjectedPayload>,
     ) -> Self {
-        eprintln!("INITIALIZING");
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(300));
             if tx
@@ -145,14 +144,11 @@ impl fly_io::Node<CounterPayload, InjectedPayload> for CounterNode {
 
         let result = Self {
             node_id: init.node_id,
-            value: Arc::new(RwLock::new(0)),
         };
 
         network
             .send(result.construct_message(SequentialStore::address(), SequentialStore::write(0)))
             .expect("failed to write initial value");
-
-        eprintln!("SENT WRITE");
 
         result
     }
@@ -170,25 +166,39 @@ impl fly_io::Node<CounterPayload, InjectedPayload> for CounterNode {
                 let mut reply = message.into_reply();
                 match reply.body.payload {
                     CounterPayload::Add { delta } => {
-                        eprintln!("GETTING CURRENT VALUE");
-                        let current_value = self
-                            .read_current_value(network)
-                            .await
-                            .context("reading current value from add")?;
+                        let mut new_value: usize;
+                        let mut request_count = 0;
+                        loop {
+                            let current_value = self
+                                .read_current_value(network)
+                                .await
+                                .context("reading current value from add")?;
 
-                        let new_value = current_value + delta;
-                        network
-                            .send(self.construct_message(
-                                SequentialStore::address(),
-                                SequentialStore::compare_and_store(current_value, new_value),
-                            ))
-                            .context("adding delta")?;
+                            new_value = current_value + delta;
+                            let event = network
+                                .request(self.construct_message(
+                                    SequentialStore::address(),
+                                    SequentialStore::compare_and_store(current_value, new_value),
+                                ))
+                                .await
+                                .context("adding delta")?;
+
+                            request_count += 1;
+                            dbg!(request_count);
+
+                            let Event::Message(message) = event else {
+                                continue;
+                            };
+
+                            if let CounterPayload::CasOk = message.body.payload {
+                                break;
+                            };
+                        }
 
                         reply.body.payload = CounterPayload::AddOk;
                         network.send(reply).context("sending add_ok reply")?;
                     }
                     CounterPayload::Read => {
-                        eprintln!("READING");
                         let value = self
                             .read_current_value(network)
                             .await
@@ -196,12 +206,12 @@ impl fly_io::Node<CounterPayload, InjectedPayload> for CounterNode {
 
                         reply.body.payload = CounterPayload::ReadOk { value };
                         network.send(reply).context("sending read reply")?;
-                        eprintln!("HAVE READ");
                     }
                     CounterPayload::AddOk => {}
                     CounterPayload::ReadOk { .. } => {}
                     CounterPayload::CasOk => {}
                     CounterPayload::WriteOk => {}
+                    CounterPayload::Error { .. } => {}
                 }
             }
         }
