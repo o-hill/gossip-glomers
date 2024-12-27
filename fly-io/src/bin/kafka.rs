@@ -4,7 +4,7 @@ use anyhow::{anyhow, Context};
 use fly_io::{
     network::Network,
     protocol::{Body, Message},
-    service::{LinearStore, StorageType},
+    service::{LinearStore, SequentialStore, StorageType},
     Event,
 };
 use serde::{Deserialize, Serialize};
@@ -76,10 +76,10 @@ impl KafkaNode {
         Self { node_id }
     }
 
-    fn message<P>(&self, payload: P) -> Message<P> {
+    fn message<P>(&self, dst: String, payload: P) -> Message<P> {
         Message {
             src: self.node_id.clone(),
-            dst: LinearStore::address(),
+            dst,
             body: Body {
                 id: None,
                 in_reply_to: None,
@@ -92,14 +92,18 @@ impl KafkaNode {
         &self,
         key: String,
         value: StorageType,
+        dst: String,
         network: &Network<KafkaPayload>,
     ) -> anyhow::Result<()> {
-        let message = self.message(KafkaPayload::Cas {
-            key,
-            from: value.clone(),
-            to: value,
-            create_if_not_exists: Some(true),
-        });
+        let message = self.message(
+            dst,
+            KafkaPayload::Cas {
+                key,
+                from: value.clone(),
+                to: value,
+                create_if_not_exists: Some(true),
+            },
+        );
         let response = network.request(message).await.context("writing key")?;
         let Event::Message(message) = response else {
             return Err(anyhow!("write event did not return a message"));
@@ -118,9 +122,10 @@ impl KafkaNode {
     pub async fn read(
         &self,
         key: String,
+        dst: String,
         network: &Network<KafkaPayload>,
     ) -> anyhow::Result<Message<KafkaPayload>> {
-        let message = self.message(KafkaPayload::Read { key: key.clone() });
+        let message = self.message(dst, KafkaPayload::Read { key: key.clone() });
         let response = network.request(message).await.context("reading key")?;
         let Event::Message(message) = response else {
             return Err(anyhow!("read event did not return a message"));
@@ -131,10 +136,11 @@ impl KafkaNode {
     pub async fn read_or_create(
         &self,
         key: String,
+        dst: String,
         network: &Network<KafkaPayload>,
         default: Option<StorageType>,
     ) -> anyhow::Result<StorageType> {
-        let message = self.message(KafkaPayload::Read { key: key.clone() });
+        let message = self.message(dst.clone(), KafkaPayload::Read { key: key.clone() });
         let response = network.request(message).await.context("reading key")?;
         let Event::Message(message) = response else {
             return Err(anyhow!("read event did not return a message"));
@@ -142,7 +148,7 @@ impl KafkaNode {
 
         if let KafkaPayload::Error { .. } = &message.body.payload {
             let value = default.unwrap_or(StorageType::Uint(0));
-            self.write(key, value.clone(), network)
+            self.write(key, value.clone(), dst, network)
                 .await
                 .context("writing default value in read_or_create")?;
             Ok(value)
@@ -159,10 +165,11 @@ impl KafkaNode {
     async fn read_uint(
         &self,
         key: String,
+        dst: String,
         network: &Network<KafkaPayload>,
     ) -> anyhow::Result<usize> {
         let stored = self
-            .read_or_create(key, network, Some(StorageType::Uint(0)))
+            .read_or_create(key, dst, network, Some(StorageType::Uint(0)))
             .await
             .context("reading uint")?;
         let StorageType::Uint(value) = stored else {
@@ -175,10 +182,11 @@ impl KafkaNode {
     async fn read_array(
         &self,
         key: String,
+        dst: String,
         network: &Network<KafkaPayload>,
     ) -> anyhow::Result<Vec<Entry>> {
         let stored = self
-            .read_or_create(key, network, Some(StorageType::Array(Vec::new())))
+            .read_or_create(key, dst, network, Some(StorageType::Array(Vec::new())))
             .await
             .context("reading tuple array")?;
         let StorageType::Array(value) = stored else {
@@ -193,7 +201,12 @@ impl KafkaNode {
         topic: String,
         network: &Network<KafkaPayload>,
     ) -> anyhow::Result<usize> {
-        self.read_uint(format!("{}/commit", topic), network).await
+        self.read_uint(
+            format!("{}/commit", topic),
+            SequentialStore::address(),
+            network,
+        )
+        .await
     }
 
     pub async fn write_commit(
@@ -203,12 +216,15 @@ impl KafkaNode {
         to: usize,
         network: &Network<KafkaPayload>,
     ) -> anyhow::Result<()> {
-        let message = self.message(KafkaPayload::Cas {
-            key: format!("{}/commit", topic),
-            from: StorageType::Uint(from),
-            to: StorageType::Uint(to),
-            create_if_not_exists: Some(true),
-        });
+        let message = self.message(
+            SequentialStore::address(),
+            KafkaPayload::Cas {
+                key: format!("{}/commit", topic),
+                from: StorageType::Uint(from),
+                to: StorageType::Uint(to),
+                create_if_not_exists: Some(true),
+            },
+        );
         let event = network.request(message).await.context("cas for commit")?;
         let Event::Message(message) = event else {
             return Err(anyhow!("event not a message in cas response"));
@@ -225,7 +241,8 @@ impl KafkaNode {
         topic: String,
         network: &Network<KafkaPayload>,
     ) -> anyhow::Result<Vec<Entry>> {
-        self.read_array(format!("{}/log", topic), network).await
+        self.read_array(format!("{}/log", topic), LinearStore::address(), network)
+            .await
     }
 
     async fn append_entry(
@@ -237,17 +254,20 @@ impl KafkaNode {
         let key = format!("{}/log", topic.clone());
         loop {
             let mut current = self
-                .read_array(key.clone(), network)
+                .read_array(key.clone(), LinearStore::address(), network)
                 .await
                 .context("reading log")?;
             let offset = current.len();
             current.push(entry);
-            let message = self.message(KafkaPayload::Cas {
-                key: key.clone(),
-                from: StorageType::Array(current[..current.len() - 1].to_vec()),
-                to: StorageType::Array(current),
-                create_if_not_exists: Some(true),
-            });
+            let message = self.message(
+                LinearStore::address(),
+                KafkaPayload::Cas {
+                    key: key.clone(),
+                    from: StorageType::Array(current[..current.len() - 1].to_vec()),
+                    to: StorageType::Array(current),
+                    create_if_not_exists: Some(true),
+                },
+            );
             let response = network
                 .request(message)
                 .await
@@ -271,6 +291,7 @@ impl KafkaNode {
         self.write(
             format!("{}/log", topic),
             StorageType::Array(vec![entry]),
+            LinearStore::address(),
             network,
         )
         .await
@@ -285,7 +306,7 @@ impl KafkaNode {
         entry: Entry,
     ) -> anyhow::Result<usize> {
         let message = self
-            .read(format!("{}/log", topic), network)
+            .read(format!("{}/log", topic), LinearStore::address(), network)
             .await
             .context("reading log")?;
 
