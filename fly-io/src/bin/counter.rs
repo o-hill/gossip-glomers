@@ -4,26 +4,27 @@ use anyhow::{anyhow, Context};
 use fly_io::{
     network::Network,
     protocol::{Body, Message},
+    service::{SequentialStore, StoragePayload},
     Event,
 };
 use serde::{Deserialize, Serialize};
 
 pub struct SequentialStore;
 impl SequentialStore {
-    fn address() -> String {
+    pub fn address() -> String {
         "seq-kv".to_string()
     }
 
-    fn key() -> String {
+    pub fn key() -> String {
         "value".to_string()
     }
 
-    fn read() -> SequentialStorePayload {
-        SequentialStorePayload::Read { key: Self::key() }
+    fn read() -> StoragePayload {
+        StoragePayload::Read { key: Self::key() }
     }
 
-    fn compare_and_store(from: usize, to: usize) -> SequentialStorePayload {
-        SequentialStorePayload::Cas {
+    fn compare_and_store(from: usize, to: usize) -> StoragePayload {
+        StoragePayload::Cas {
             key: Self::key(),
             from,
             to,
@@ -31,23 +32,24 @@ impl SequentialStore {
         }
     }
 
-    fn write(value: usize) -> SequentialStorePayload {
-        SequentialStorePayload::Write {
+    fn write(value: usize) -> StoragePayload {
+        StoragePayload::Write {
             key: Self::key(),
             value,
         }
     }
 
-    fn initialize(
-        node_id: String,
-        network: &mut Network<CounterPayload, InjectedPayload>,
-    ) -> anyhow::Result<()> {
+    pub fn initialize<P, IP>(node_id: String, network: &mut Network<P, IP>) -> anyhow::Result<()>
+    where
+        P: Serialize + Clone + Send + DeserializeOwned + 'static,
+        IP: Clone + Send + 'static,
+    {
         network
             .send(Self::construct_message(node_id, Self::write(0)))
             .context("initializing storage value")
     }
 
-    fn construct_message<P>(node_id: String, payload: P) -> Message<P> {
+    pub fn construct_message<P>(node_id: String, payload: P) -> Message<P> {
         Message {
             src: node_id,
             dst: Self::address(),
@@ -59,7 +61,7 @@ impl SequentialStore {
         }
     }
 
-    async fn read_current_value(
+    pub async fn read_current_value<P, IP>(
         node_id: String,
         network: &mut Network<CounterPayload, InjectedPayload>,
     ) -> anyhow::Result<usize> {
@@ -79,11 +81,15 @@ impl SequentialStore {
         Ok(value)
     }
 
-    async fn add_to_current_value(
+    pub async fn add_to_current_value<P, IP>(
         node_id: String,
-        network: &mut Network<CounterPayload, InjectedPayload>,
+        network: &mut Network<P, IP>,
         delta: usize,
-    ) -> anyhow::Result<usize> {
+    ) -> anyhow::Result<usize>
+    where
+        P: Serialize + Clone + Send + DeserializeOwned + 'static,
+        IP: Clone + Send + 'static,
+    {
         let mut new_value: usize;
         let mut request_count = 0;
         loop {
@@ -114,30 +120,6 @@ impl SequentialStore {
 
         Ok(new_value)
     }
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-#[serde(tag = "type")]
-#[serde(rename_all = "snake_case")]
-enum SequentialStorePayload {
-    Read {
-        key: String,
-    },
-    ReadOk {
-        value: usize,
-    },
-    Write {
-        key: String,
-        value: usize,
-    },
-    WriteOk,
-    Cas {
-        key: String,
-        from: usize,
-        to: usize,
-        create_if_not_exists: Option<bool>,
-    },
-    CasOk,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

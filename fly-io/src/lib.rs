@@ -3,6 +3,7 @@ use protocol::Message;
 pub mod network;
 pub mod protocol;
 pub mod server;
+pub mod service;
 
 #[derive(Debug, Clone)]
 pub enum Event<Payload, InjectedPayload = ()> {

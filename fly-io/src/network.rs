@@ -97,7 +97,6 @@ where
     ) -> Option<tokio::sync::oneshot::Sender<Event<P, IP>>> {
         if let Event::Message(message) = event {
             if let Some(replying_to) = message.body.in_reply_to {
-                dbg!("REPLYING TO", replying_to);
                 let request = self
                     .awaiting_responses
                     .write()
@@ -125,7 +124,6 @@ where
         );
         let _lock = self.stdout_lock.lock().unwrap();
         message.send().context("failed to send message")?;
-        dbg!("SENT");
         Ok(())
     }
 
@@ -140,16 +138,17 @@ where
         let id = self.next_message_id();
 
         message.body.id = Some(id);
-        dbg!("REQUESTING {:?}", message.clone());
+        dbg!(
+            "REQUESTING {:?}",
+            serde_json::to_string(&message).expect("could not serialize message")
+        );
         message.send().context("failed to request message")?;
         drop(_lock);
-        dbg!("REQUESTED");
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.awaiting_responses.write().unwrap().insert(id, tx);
 
         let response = rx.await.context("failed to receive response")?;
-        dbg!("RECEIVED RESPONSE", id);
         Ok(response)
     }
 
