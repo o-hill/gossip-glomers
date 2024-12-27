@@ -4,7 +4,7 @@ use serde::Serialize;
 
 use crate::protocol::{InitPayload, Message};
 
-pub struct Server<P, IP>
+pub struct Server<P, IP = ()>
 where
     P: Clone,
     IP: Clone,

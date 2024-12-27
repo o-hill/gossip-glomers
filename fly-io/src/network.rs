@@ -119,7 +119,10 @@ where
         PAYLOAD: Serialize + Clone + Debug,
     {
         message.body.id = Some(self.next_message_id());
-        dbg!("SENDING {:?}", message.clone());
+        dbg!(
+            "SENDING {:?}",
+            serde_json::to_string(&message).expect("serializing message failed")
+        );
         let _lock = self.stdout_lock.lock().unwrap();
         message.send().context("failed to send message")?;
         dbg!("SENT");
