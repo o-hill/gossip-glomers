@@ -16,42 +16,19 @@ pub enum InitPayload {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Body<Payload> {
+pub struct UntypedBody {
     #[serde(rename = "msg_id")]
     pub id: Option<usize>,
     pub in_reply_to: Option<usize>,
 
     #[serde(flatten)]
-    pub payload: Payload,
+    pub payload: serde_json::Value,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
-pub struct Message<Payload> {
+pub struct UntypedMessage {
     pub src: String,
     #[serde(rename = "dest")]
     pub dst: String,
-    pub body: Body<Payload>,
-}
-
-impl<P> Message<P> {
-    pub fn into_reply(self) -> Self {
-        Self {
-            src: self.dst,
-            dst: self.src,
-            body: Body {
-                id: None,
-                in_reply_to: self.body.id,
-                payload: self.body.payload,
-            },
-        }
-    }
-
-    pub fn send(&self) -> anyhow::Result<()>
-    where
-        P: Serialize,
-    {
-        let message = serde_json::to_string(self).context("serialize message to stdout")?;
-        println!("{}", message);
-        Ok(())
-    }
+    pub body: UntypedBody,
 }

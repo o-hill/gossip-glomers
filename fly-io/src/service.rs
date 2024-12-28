@@ -1,11 +1,17 @@
+use std::fmt::Debug;
+
 use anyhow::Context;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::{
-    network::Network,
-    protocol::{Body, Message},
-    Event,
-};
+use crate::{network::Network, Body, Message};
+
+pub type Entry = usize;
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum StorageType {
+    Uint(Entry),
+    Array(Vec<Entry>),
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
@@ -15,68 +21,111 @@ pub enum StoragePayload {
         key: String,
     },
     ReadOk {
-        value: usize,
+        value: serde_json::Value,
     },
     Write {
         key: String,
-        value: usize,
+        value: serde_json::Value,
     },
     WriteOk,
     Cas {
         key: String,
-        from: usize,
-        to: usize,
+        from: serde_json::Value,
+        to: serde_json::Value,
         create_if_not_exists: Option<bool>,
     },
     CasOk,
-}
-
-#[derive(Serialize, Deserialize, Debug, Clone)]
-pub enum StorageType {
-    Array(Vec<usize>),
-    Uint(usize),
+    Error {
+        code: usize,
+        text: String,
+    },
 }
 
 #[derive(Debug, Clone)]
-pub struct SequentialStore {}
+pub struct SequentialStore {
+    node_id: String,
+}
 
 impl SequentialStore {
+    pub fn new(node_id: String) -> Self {
+        Self { node_id }
+    }
+
     pub fn address() -> String {
         "seq-kv".to_string()
     }
 
-    pub fn key() -> String {
-        "value".to_string()
-    }
-
-    fn read() -> StoragePayload {
-        StoragePayload::Read { key: Self::key() }
-    }
-
-    pub fn compare_and_store(from: usize, to: usize) -> StoragePayload {
-        StoragePayload::Cas {
-            key: Self::key(),
-            from,
-            to,
-            create_if_not_exists: Some(true),
-        }
-    }
-
-    fn write(value: usize) -> StoragePayload {
-        StoragePayload::Write {
-            key: Self::key(),
-            value,
-        }
-    }
-
-    pub fn initialize<P, IP>(node_id: String, network: &mut Network<P, IP>) -> anyhow::Result<()>
+    pub async fn read<T, IP>(&self, key: String, network: &mut Network<IP>) -> anyhow::Result<T>
     where
-        P: Serialize + Clone + Send + DeserializeOwned + 'static,
-        IP: Clone + Send + 'static,
+        IP: Send + Debug + Clone + 'static,
+        T: DeserializeOwned,
     {
-        network
-            .send(Self::construct_message(node_id, Self::write(0)))
-            .context("initializing storage value")
+        let message = Self::construct_message(self.node_id.clone(), StoragePayload::Read { key });
+        let response = network
+            .request(message)
+            .await
+            .context("fetching value for key")?;
+
+        match response.body.payload {
+            StoragePayload::ReadOk { value } => {
+                serde_json::from_value(value).context("deserializing read value")
+            }
+            _ => Err(anyhow::anyhow!("error returned from read request")),
+        }
+    }
+
+    pub fn write<T, IP>(
+        &self,
+        key: String,
+        value: T,
+        network: &mut Network<IP>,
+    ) -> anyhow::Result<()>
+    where
+        IP: Send + Debug + Clone + 'static,
+        T: Serialize,
+    {
+        let message = Self::construct_message(
+            self.node_id.clone(),
+            StoragePayload::Write {
+                key,
+                value: serde_json::to_value(value).expect("failed to serialize value"),
+            },
+        );
+
+        network.send(message).context("writing value for key")?;
+        Ok(())
+    }
+
+    pub async fn compare_and_store<T, IP>(
+        &self,
+        key: String,
+        from: T,
+        to: T,
+        network: &mut Network<IP>,
+    ) -> anyhow::Result<()>
+    where
+        IP: Send + Debug + Clone + 'static,
+        T: Serialize,
+    {
+        let message = Self::construct_message(
+            self.node_id.clone(),
+            StoragePayload::Cas {
+                key,
+                from: serde_json::to_value(from).expect("failed to serialize from"),
+                to: serde_json::to_value(to).expect("failed to serialize to"),
+                create_if_not_exists: Some(true),
+            },
+        );
+
+        let response = network
+            .request(message)
+            .await
+            .context("writing value for key")?;
+
+        match response.body.payload {
+            StoragePayload::CasOk => Ok(()),
+            _ => Err(anyhow::anyhow!("error returned from cas request")),
+        }
     }
 
     pub fn construct_message<PAYLOAD>(node_id: String, payload: PAYLOAD) -> Message<PAYLOAD> {
@@ -89,28 +138,6 @@ impl SequentialStore {
                 payload,
             },
         }
-    }
-
-    pub async fn read_current_value<P, IP>(
-        node_id: String,
-        network: &mut Network<P, IP>,
-    ) -> anyhow::Result<Message<P>>
-    where
-        P: Serialize + Clone + Send + DeserializeOwned + 'static,
-        IP: Clone + Send + 'static,
-    {
-        let event = network
-            .request(Self::construct_message(node_id, SequentialStore::read()))
-            .await
-            .context("fetching current value")?;
-
-        let Event::Message(message) = event else {
-            return Err(anyhow::anyhow!(
-                "value request event response was not a message"
-            ));
-        };
-
-        Ok(message)
     }
 }
 

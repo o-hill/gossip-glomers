@@ -9,22 +9,21 @@ use anyhow::Context;
 use serde::{de::DeserializeOwned, Serialize};
 use std::thread::JoinHandle;
 
-use crate::{protocol::Message, Event};
+use crate::{protocol::UntypedMessage, Event, Message, NetworkEvent};
 
 #[derive(Debug, Clone)]
-pub struct Network<P, IP = ()> {
-    pub tx: std::sync::mpsc::Sender<Event<P, IP>>,
-    rx: Arc<Mutex<std::sync::mpsc::Receiver<Event<P, IP>>>>,
-    awaiting_responses: Arc<RwLock<HashMap<usize, tokio::sync::oneshot::Sender<Event<P, IP>>>>>,
+pub struct Network<IP = ()> {
+    pub tx: std::sync::mpsc::Sender<NetworkEvent<IP>>,
+    rx: Arc<Mutex<std::sync::mpsc::Receiver<NetworkEvent<IP>>>>,
+    awaiting_responses: Arc<RwLock<HashMap<usize, tokio::sync::oneshot::Sender<UntypedMessage>>>>,
     message_id: Arc<RwLock<usize>>,
     stdout_lock: Arc<Mutex<()>>,
     stdin_lock: Arc<Mutex<()>>,
 }
 
-impl<P, IP> Network<P, IP>
+impl<IP> Network<IP>
 where
-    P: Send + Clone + Serialize + DeserializeOwned + 'static,
-    IP: Send + Clone + 'static,
+    IP: Send + Clone + Debug + 'static,
 {
     pub fn new() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
@@ -52,10 +51,10 @@ where
             .expect("could not read from stdin")
             .context("failed to read init message from stdin")?;
 
-        let message: Message<PAYLOAD> =
+        let message: UntypedMessage =
             serde_json::from_str(&line).context("failed to deserialize message")?;
 
-        Ok(message)
+        Ok(message.into())
     }
 
     pub fn start_read_thread(&self) -> JoinHandle<anyhow::Result<()>> {
@@ -65,9 +64,9 @@ where
             for input in stdin.lines() {
                 let input = input.context("Maelstrom event could not be read from stdin")?;
                 dbg!("RECEIVED {}", input.clone());
-                let message: Message<P> = serde_json::from_str(input.as_str())
+                let message: UntypedMessage = serde_json::from_str(input.as_str())
                     .context("failed to deserialize maelstrom input")?;
-                if tx.send(Event::Message(message)).is_err() {
+                if tx.send(NetworkEvent::Message(message)).is_err() {
                     return Ok::<_, anyhow::Error>(());
                 }
             }
@@ -75,7 +74,10 @@ where
         })
     }
 
-    pub async fn recv(&mut self) -> Option<Event<P, IP>> {
+    pub async fn recv<PAYLOAD>(&mut self) -> Option<Event<PAYLOAD, IP>>
+    where
+        PAYLOAD: DeserializeOwned,
+    {
         let receiver = self.rx.lock().unwrap();
 
         loop {
@@ -83,19 +85,23 @@ where
             let Ok(event) = result else { return None };
 
             if let Some(tx) = self.is_response(&event) {
-                tx.send(event)
+                let NetworkEvent::Message(message) = event else {
+                    panic!("response message is not a message!")
+                };
+
+                tx.send(message)
                     .unwrap_or_else(|_| panic!("failed to send event"));
             } else {
-                return Some(event);
+                return Some(event.into());
             }
         }
     }
 
     fn is_response(
         &self,
-        event: &Event<P, IP>,
-    ) -> Option<tokio::sync::oneshot::Sender<Event<P, IP>>> {
-        if let Event::Message(message) = event {
+        event: &NetworkEvent<IP>,
+    ) -> Option<tokio::sync::oneshot::Sender<UntypedMessage>> {
+        if let NetworkEvent::Message(message) = event {
             if let Some(replying_to) = message.body.in_reply_to {
                 let request = self
                     .awaiting_responses
@@ -113,43 +119,43 @@ where
         None
     }
 
-    pub fn send<PAYLOAD>(&self, mut message: Message<PAYLOAD>) -> anyhow::Result<()>
+    pub fn inject(&self, payload: IP) -> anyhow::Result<()> {
+        self.tx
+            .send(NetworkEvent::Injected(payload))
+            .expect("injecting message into network");
+        Ok(())
+    }
+
+    pub fn send<PAYLOAD>(&self, mut message: Message<PAYLOAD>) -> anyhow::Result<usize>
     where
         PAYLOAD: Serialize + Clone + Debug,
     {
-        message.body.id = Some(self.next_message_id());
+        let id = self.next_message_id();
+        message.body.id = Some(id);
         dbg!(
             "SENDING {:?}",
             serde_json::to_string(&message).expect("serializing message failed")
         );
         let _lock = self.stdout_lock.lock().unwrap();
-        message.send().context("failed to send message")?;
-        Ok(())
+        let output = serde_json::to_string(&message).context("serializing message")?;
+        println!("{}", output);
+        Ok(id)
     }
 
     pub async fn request<PAYLOAD>(
         &self,
-        mut message: Message<PAYLOAD>,
-    ) -> anyhow::Result<Event<P, IP>>
+        message: Message<PAYLOAD>,
+    ) -> anyhow::Result<Message<PAYLOAD>>
     where
-        PAYLOAD: Serialize + Clone + Debug,
+        PAYLOAD: DeserializeOwned + Serialize + Clone + Debug,
     {
-        let _lock = self.stdout_lock.lock().unwrap();
-        let id = self.next_message_id();
-
-        message.body.id = Some(id);
-        dbg!(
-            "REQUESTING {:?}",
-            serde_json::to_string(&message).expect("could not serialize message")
-        );
-        message.send().context("failed to request message")?;
-        drop(_lock);
+        let id = self.send(message).context("sending message in request")?;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.awaiting_responses.write().unwrap().insert(id, tx);
 
         let response = rx.await.context("failed to receive response")?;
-        Ok(response)
+        Ok(response.into())
     }
 
     fn next_message_id(&self) -> usize {

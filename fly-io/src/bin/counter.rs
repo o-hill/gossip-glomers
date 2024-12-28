@@ -1,9 +1,5 @@
-use anyhow::{anyhow, Context};
-use fly_io::{
-    network::Network,
-    service::{SequentialStore, StoragePayload},
-    Event,
-};
+use anyhow::Context;
+use fly_io::{network::Network, service::SequentialStore};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -14,59 +10,41 @@ enum CounterPayload {
     AddOk,
     Read,
     ReadOk { value: usize },
-    CasOk,
-    WriteOk,
-    Error { code: usize, text: String },
 }
 
 #[derive(Debug, Clone)]
 struct CounterNode {
     node_id: String,
+    storage: SequentialStore,
 }
 
 impl CounterNode {
-    pub async fn read_current_value(
-        &self,
-        network: &mut Network<CounterPayload>,
-    ) -> anyhow::Result<usize> {
-        let message = SequentialStore::read_current_value(self.node_id.clone(), network)
-            .await
-            .context("reading current value from add")?;
-
-        let CounterPayload::ReadOk { value } = message.body.payload else {
-            return Err(anyhow!("value request message response was not ReadOk"));
-        };
-
-        Ok(value)
+    fn storage_key() -> String {
+        "value".to_string()
     }
 
     pub async fn add_to_current_value(
         &self,
-        network: &mut Network<CounterPayload>,
+        network: &mut Network,
         delta: usize,
     ) -> anyhow::Result<usize> {
         let mut new_value: usize;
         loop {
             let current_value = self
-                .read_current_value(network)
+                .storage
+                .read(Self::storage_key(), network)
                 .await
-                .context("reading current value")?;
+                .context("reading value from storage")?;
 
             new_value = current_value + delta;
-            let event = network
-                .request(SequentialStore::construct_message::<StoragePayload>(
-                    self.node_id.clone(),
-                    SequentialStore::compare_and_store(current_value, new_value),
-                ))
+            if self
+                .storage
+                .compare_and_store(Self::storage_key(), current_value, new_value, network)
                 .await
-                .context("adding delta")?;
-
-            let Event::Message(message) = event else {
-                continue;
-            };
-
-            if let CounterPayload::CasOk = message.body.payload {
-                return Ok::<_, anyhow::Error>(new_value);
+                .context("adding delta")
+                .is_ok()
+            {
+                return Ok(new_value);
             };
         }
     }
@@ -74,16 +52,15 @@ impl CounterNode {
 
 #[async_trait::async_trait]
 impl fly_io::Node<CounterPayload> for CounterNode {
-    fn from_init(
-        init: fly_io::protocol::Init,
-        _tx: std::sync::mpsc::Sender<fly_io::Event<CounterPayload>>,
-        network: &mut Network<CounterPayload>,
-    ) -> Self {
+    fn from_init(init: fly_io::protocol::Init, network: &mut Network) -> Self {
         let result = Self {
-            node_id: init.node_id,
+            node_id: init.node_id.clone(),
+            storage: SequentialStore::new(init.node_id),
         };
 
-        SequentialStore::initialize(result.node_id.clone(), network)
+        result
+            .storage
+            .write(Self::storage_key(), 0, network)
             .expect("failed to initialize storage");
 
         result
@@ -92,9 +69,10 @@ impl fly_io::Node<CounterPayload> for CounterNode {
     async fn step(
         &mut self,
         event: fly_io::Event<CounterPayload>,
-        network: &mut Network<CounterPayload>,
+        network: &mut Network,
     ) -> anyhow::Result<()> {
         match event {
+            fly_io::Event::Storage(_) => {}
             fly_io::Event::Injected(_) => {}
             fly_io::Event::Message(message) => {
                 let mut reply = message.into_reply();
@@ -110,18 +88,16 @@ impl fly_io::Node<CounterPayload> for CounterNode {
                     }
                     CounterPayload::Read => {
                         let value = self
-                            .read_current_value(network)
+                            .storage
+                            .read(Self::storage_key(), network)
                             .await
-                            .context("reading current value from read")?;
+                            .context("reading value from storage")?;
 
                         reply.body.payload = CounterPayload::ReadOk { value };
                         network.send(reply).context("sending read reply")?;
                     }
                     CounterPayload::AddOk => {}
                     CounterPayload::ReadOk { .. } => {}
-                    CounterPayload::CasOk => {}
-                    CounterPayload::WriteOk => {}
-                    CounterPayload::Error { .. } => {}
                 }
             }
         }
@@ -131,5 +107,5 @@ impl fly_io::Node<CounterPayload> for CounterNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    fly_io::server::Server::<CounterPayload>::new().serve::<CounterNode>()
+    fly_io::server::Server::new().serve::<CounterNode, CounterPayload>()
 }
