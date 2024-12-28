@@ -13,14 +13,23 @@ where
     network: crate::network::Network<IP>,
 }
 
-impl<IP> Server<IP>
+impl<IP> Default for Server<IP>
 where
-    IP: Debug + Send + Clone + 'static,
+    IP: Debug + Clone + Send + Sync + 'static,
 {
-    pub fn new() -> Self {
+    fn default() -> Self {
         Self {
             network: crate::network::Network::new(),
         }
+    }
+}
+
+impl<IP> Server<IP>
+where
+    IP: Debug + Clone + Send + Sync + 'static,
+{
+    pub fn new() -> Self {
+        Self::default()
     }
 
     fn construct_node<NODE, PAYLOAD>(&self, init_msg: Message<InitPayload>) -> anyhow::Result<NODE>
@@ -31,7 +40,7 @@ where
             panic!("first message was not an init");
         };
 
-        let node = NODE::from_init(init, &mut self.network.clone());
+        let node = NODE::from_init(init, &self.network.clone());
 
         let mut reply = init_msg.into_reply();
         reply.body.payload = InitPayload::InitOk;
@@ -58,9 +67,9 @@ where
 
         let mut js = tokio::task::JoinSet::new();
         while let Some(event) = self.network.recv::<PAYLOAD>().await {
-            let mut network = self.network.clone();
+            let network = self.network.clone();
             let mut n = node.clone();
-            js.spawn(async move { n.step(event, &mut network).await });
+            js.spawn(async move { n.step(event, &network).await });
         }
 
         jh.join()

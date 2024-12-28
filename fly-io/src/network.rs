@@ -21,11 +21,8 @@ pub struct Network<IP = ()> {
     stdin_lock: Arc<Mutex<()>>,
 }
 
-impl<IP> Network<IP>
-where
-    IP: Send + Clone + Debug + 'static,
-{
-    pub fn new() -> Self {
+impl<IP> Default for Network<IP> {
+    fn default() -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         Self {
             tx,
@@ -35,6 +32,15 @@ where
             stdout_lock: Arc::new(Mutex::new(())),
             stdin_lock: Arc::new(Mutex::new(())),
         }
+    }
+}
+
+impl<IP> Network<IP>
+where
+    IP: Send + Clone + Debug + 'static,
+{
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn read<PAYLOAD>(&mut self) -> anyhow::Result<Message<PAYLOAD>>

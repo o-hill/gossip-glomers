@@ -7,7 +7,7 @@ use anyhow::Context;
 use fly_io::{
     network::Network,
     service::{LinearStore, SequentialStore, Storage},
-    Body, Event, Message,
+    Event,
 };
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
@@ -21,10 +21,6 @@ struct StorageKey {}
 impl StorageKey {
     fn log(topic: &str) -> String {
         format!("{}/log", topic)
-    }
-
-    fn offset(topic: &str) -> String {
-        format!("{}/offset", topic)
     }
 
     fn commit() -> String {
