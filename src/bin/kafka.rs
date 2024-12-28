@@ -131,6 +131,35 @@ impl KafkaNode {
             *self.cas_failures.write().unwrap() += 1;
         }
     }
+
+    async fn select_entries(
+        &self,
+        topic: String,
+        requested_offset: Offset,
+        network: &Network,
+    ) -> Option<Vec<(Offset, Entry)>> {
+        let Ok(log) = self
+            .linear_store
+            .read::<Log>(StorageKey::log(&topic), network)
+            .await
+        else {
+            return None;
+        };
+
+        if log.len() <= requested_offset {
+            return None;
+        }
+
+        let n_logs = std::cmp::min(3, log.len() - requested_offset);
+        let selected = log[requested_offset..requested_offset + n_logs]
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(i, entry)| (requested_offset + i, entry))
+            .collect::<Vec<_>>();
+
+        Some(selected)
+    }
 }
 
 impl Drop for KafkaNode {
@@ -173,35 +202,12 @@ impl fly_io::Node<KafkaPayload> for KafkaNode {
                     KafkaPayload::Poll { offsets } => {
                         let mut result = HashMap::new();
                         for (topic, requested_offset) in offsets.into_iter() {
-                            let Ok(log) = self
-                                .linear_store
-                                .read::<Log>(StorageKey::log(&topic), network)
+                            if let Some(selected) = self
+                                .select_entries(topic.clone(), requested_offset, network)
                                 .await
-                            else {
-                                continue;
-                            };
-
-                            if log.len() <= requested_offset {
-                                continue;
+                            {
+                                result.insert(topic, selected);
                             }
-
-                            let n_logs = std::cmp::min(3, log.len() - requested_offset);
-                            let selected = log[requested_offset..requested_offset + n_logs]
-                                .iter()
-                                .cloned()
-                                .enumerate()
-                                .map(|(i, entry)| (requested_offset + i, entry))
-                                .collect::<Vec<_>>();
-
-                            eprintln!(
-                                "topic={}, n_logs={}, start={}, last_offset={:?}",
-                                topic.clone(),
-                                1,
-                                requested_offset,
-                                log.last()
-                            );
-
-                            result.insert(topic, selected);
                         }
                         Some(KafkaPayload::PollOk { msgs: result })
                     }
