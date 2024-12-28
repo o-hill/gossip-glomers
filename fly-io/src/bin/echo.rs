@@ -14,18 +14,14 @@ pub struct EchoNode {}
 
 #[async_trait::async_trait]
 impl fly_io::Node<EchoPayload> for EchoNode {
-    fn from_init(
-        _init: fly_io::protocol::Init,
-        _tx: std::sync::mpsc::Sender<fly_io::Event<EchoPayload>>,
-        _network: &mut fly_io::network::Network<EchoPayload>,
-    ) -> Self {
+    fn from_init(_init: fly_io::protocol::Init, _network: &fly_io::network::Network) -> Self {
         EchoNode {}
     }
 
     async fn step(
         &mut self,
         input: fly_io::Event<EchoPayload>,
-        network: &mut fly_io::network::Network<EchoPayload>,
+        network: &fly_io::network::Network,
     ) -> anyhow::Result<()> {
         let fly_io::Event::Message(input) = input else {
             panic!("Echo node received a non-message event");
@@ -44,5 +40,5 @@ impl fly_io::Node<EchoPayload> for EchoNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    fly_io::server::Server::<EchoPayload, ()>::new().serve::<EchoNode>()
+    fly_io::server::Server::new().serve::<EchoNode, EchoPayload>()
 }

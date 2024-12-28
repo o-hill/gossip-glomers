@@ -13,6 +13,10 @@ pub enum StorageType {
     Array(Vec<Entry>),
 }
 
+pub const LINEAR_STORE_ADDRESS: &str = "lin-kv";
+pub const SEQUENTIAL_STORE_ADDRESS: &str = "seq-kv";
+pub const STORAGE_ADDRESSES: [&str; 2] = [LINEAR_STORE_ADDRESS, SEQUENTIAL_STORE_ADDRESS];
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
@@ -43,24 +47,60 @@ pub enum StoragePayload {
 
 #[derive(Debug, Clone)]
 pub struct SequentialStore {
-    node_id: String,
+    _node_id: String,
 }
 
 impl SequentialStore {
     pub fn new(node_id: String) -> Self {
-        Self { node_id }
+        Self { _node_id: node_id }
+    }
+}
+
+impl Storage<()> for SequentialStore {
+    fn node_id(&self) -> String {
+        self._node_id.clone()
     }
 
-    pub fn address() -> String {
-        "seq-kv".to_string()
+    fn address(&self) -> String {
+        SEQUENTIAL_STORE_ADDRESS.to_string()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LinearStore {
+    _node_id: String,
+}
+
+impl LinearStore {
+    pub fn new(node_id: String) -> Self {
+        Self { _node_id: node_id }
+    }
+}
+
+impl Storage<()> for LinearStore {
+    fn node_id(&self) -> String {
+        self._node_id.clone()
     }
 
-    pub async fn read<T, IP>(&self, key: String, network: &mut Network<IP>) -> anyhow::Result<T>
+    fn address(&self) -> String {
+        LINEAR_STORE_ADDRESS.to_string()
+    }
+}
+
+#[async_trait::async_trait]
+pub trait Storage<IP>: Send
+where
+    IP: Send + Debug + Clone + 'static,
+{
+    fn node_id(&self) -> String;
+    fn address(&self) -> String; // Should be static but needs a receiver to implement Send.
+
+    async fn read<T>(&self, key: String, network: &Network<IP>) -> anyhow::Result<T>
     where
         IP: Send + Debug + Clone + 'static,
         T: DeserializeOwned,
     {
-        let message = Self::construct_message(self.node_id.clone(), StoragePayload::Read { key });
+        let message = self.construct_message(self.node_id().clone(), StoragePayload::Read { key });
         let response = network
             .request(message)
             .await
@@ -74,18 +114,12 @@ impl SequentialStore {
         }
     }
 
-    pub fn write<T, IP>(
-        &self,
-        key: String,
-        value: T,
-        network: &mut Network<IP>,
-    ) -> anyhow::Result<()>
+    fn write<T>(&self, key: String, value: T, network: &Network<IP>) -> anyhow::Result<()>
     where
-        IP: Send + Debug + Clone + 'static,
         T: Serialize,
     {
-        let message = Self::construct_message(
-            self.node_id.clone(),
+        let message = self.construct_message(
+            self.node_id().clone(),
             StoragePayload::Write {
                 key,
                 value: serde_json::to_value(value).expect("failed to serialize value"),
@@ -96,19 +130,18 @@ impl SequentialStore {
         Ok(())
     }
 
-    pub async fn compare_and_store<T, IP>(
+    async fn compare_and_store<T>(
         &self,
         key: String,
         from: T,
         to: T,
-        network: &mut Network<IP>,
+        network: &Network<IP>,
     ) -> anyhow::Result<()>
     where
-        IP: Send + Debug + Clone + 'static,
-        T: Serialize,
+        T: Serialize + Send,
     {
-        let message = Self::construct_message(
-            self.node_id.clone(),
+        let message = self.construct_message(
+            self.node_id().clone(),
             StoragePayload::Cas {
                 key,
                 from: serde_json::to_value(from).expect("failed to serialize from"),
@@ -128,23 +161,15 @@ impl SequentialStore {
         }
     }
 
-    pub fn construct_message<PAYLOAD>(node_id: String, payload: PAYLOAD) -> Message<PAYLOAD> {
+    fn construct_message<PAYLOAD>(&self, node_id: String, payload: PAYLOAD) -> Message<PAYLOAD> {
         Message {
             src: node_id,
-            dst: Self::address(),
+            dst: self.address(),
             body: Body {
                 id: None,
                 in_reply_to: None,
                 payload,
             },
         }
-    }
-}
-
-pub struct LinearStore {}
-
-impl LinearStore {
-    pub fn address() -> String {
-        "lin-kv".to_string()
     }
 }

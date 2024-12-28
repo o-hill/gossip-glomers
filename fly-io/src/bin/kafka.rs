@@ -3,31 +3,32 @@ use std::{
     sync::{Arc, RwLock},
 };
 
-use anyhow::{anyhow, Context};
+use anyhow::Context;
 use fly_io::{
     network::Network,
-    protocol::{Body, Message},
-    service::{LinearStore, SequentialStore},
-    Event,
+    service::{LinearStore, SequentialStore, Storage},
+    Body, Event, Message,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
 type Topic = String;
 type Offset = usize;
 type Entry = usize;
+type Log = Vec<Entry>;
+type CommitOffsets = HashMap<String, Offset>;
 
 struct StorageKey {}
 impl StorageKey {
-    fn log(topic: &str, offset: Offset) -> String {
-        format!("{}/log/{}", topic, offset)
+    fn log(topic: &str) -> String {
+        format!("{}/log", topic)
     }
 
     fn offset(topic: &str) -> String {
         format!("{}/offset", topic)
     }
 
-    fn commit(topic: &str) -> String {
-        format!("{}/commit", topic)
+    fn commit() -> String {
+        "commits".to_string()
     }
 }
 
@@ -35,7 +36,6 @@ impl StorageKey {
 #[serde(tag = "type")]
 #[serde(rename_all = "snake_case")]
 enum KafkaPayload {
-    // RPC
     Send {
         key: Topic,
         msg: usize,
@@ -59,365 +59,90 @@ enum KafkaPayload {
     ListCommittedOffsetsOk {
         offsets: HashMap<Topic, Offset>,
     },
-    // Storage node payloads
-    Read {
-        key: String,
-    },
-    ReadOk {
-        value: Entry,
-    },
-    Write {
-        key: String,
-        value: Entry,
-    },
-    WriteOk,
-    Cas {
-        key: String,
-        from: Entry,
-        to: Entry,
-        create_if_not_exists: Option<bool>,
-    },
-    CasOk,
-    Error {
-        code: usize,
-        text: String,
-    },
 }
 
 #[derive(Clone)]
 struct KafkaNode {
-    node_id: String,
-    class_leader: usize,
-    n_classes: usize,
-    entries: HashMap<Topic, HashMap<Offset, Entry>>,
+    linear_store: LinearStore,
+    sequential_store: SequentialStore,
     pub cas_failures: Arc<RwLock<usize>>,
-    pub total_offset_writes: Arc<RwLock<usize>>,
+    pub total_appends: Arc<RwLock<usize>>,
 }
 
 impl KafkaNode {
-    pub fn new(node_id: String, class_leader: usize, n_classes: usize) -> Self {
+    pub fn new(node_id: String) -> Self {
         Self {
-            node_id,
-            class_leader,
-            n_classes,
-            entries: HashMap::new(),
+            linear_store: LinearStore::new(node_id.clone()),
+            sequential_store: SequentialStore::new(node_id.clone()),
             cas_failures: Arc::new(RwLock::new(0)),
-            total_offset_writes: Arc::new(RwLock::new(0)),
+            total_appends: Arc::new(RwLock::new(0)),
         }
     }
 
-    fn message<P>(&self, dst: String, payload: P) -> Message<P> {
-        Message {
-            src: self.node_id.clone(),
-            dst,
-            body: Body {
-                id: None,
-                in_reply_to: None,
-                payload,
-            },
-        }
-    }
-
-    pub async fn write(
+    pub async fn read_or_create<T, STORAGE>(
         &self,
         key: String,
-        from: Option<Entry>,
-        to: Entry,
-        dst: String,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<()> {
-        let message = self.message(
-            dst,
-            KafkaPayload::Cas {
-                key,
-                from: from.unwrap_or(to),
-                to,
-                create_if_not_exists: Some(true),
-            },
-        );
-        let response = network.request(message).await.context("writing key")?;
-        let Event::Message(message) = response else {
-            return Err(anyhow!("write event did not return a message"));
+        storage: &STORAGE,
+        network: &Network,
+    ) -> anyhow::Result<T>
+    where
+        T: Send + Serialize + DeserializeOwned + Default + Clone,
+        STORAGE: Storage<()> + Sync,
+    {
+        if let Ok(value) = storage.read::<T>(key.clone(), network).await {
+            return Ok(value);
         };
 
-        let KafkaPayload::CasOk = message.body.payload else {
-            return Err(anyhow!(
-                "write response was not write_ok, found {:?}",
-                message.body.payload
-            ));
-        };
-
-        Ok(())
-    }
-
-    pub async fn read<T>(
-        &self,
-        key: String,
-        dst: String,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<T> {
-        let message = self.message(dst, KafkaPayload::Read { key: key.clone() });
-        let response = network.request(message).await.context("reading key")?;
-        let Event::Message(message) = response else {
-            return Err(anyhow!("read event did not return a message"));
-        };
-
-        match message.body.payload {
-            KafkaPayload::Error { .. } => Err(anyhow!("error reading key")),
-            KafkaPayload::ReadOk { value } => 
-        } 
-        Ok(message)
-    }
-
-    pub async fn read_or_create(
-        &self,
-        key: String,
-        dst: String,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<Entry> {
-        let message = self.message(dst.clone(), KafkaPayload::Read { key: key.clone() });
-        let response = network.request(message).await.context("reading key")?;
-        let Event::Message(message) = response else {
-            return Err(anyhow!("read event did not return a message"));
-        };
-
-        if let KafkaPayload::Error { .. } = &message.body.payload {
-            let value = 0;
-            self.write(key, None, value, dst, network)
-                .await
-                .context("writing default value in read_or_create")?;
-            Ok(value)
-        } else if let KafkaPayload::ReadOk { value } = message.body.payload {
-            Ok(value)
-        } else {
-            Err(anyhow!(
-                "read response was not read_ok, found {:?}",
-                message.body.payload
-            ))
-        }
-    }
-
-    pub async fn read_commit(
-        &self,
-        topic: String,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<usize> {
-        self.read_or_create(
-            StorageKey::commit(&topic),
-            SequentialStore::address(),
-            network,
-        )
-        .await
-    }
-
-    pub async fn read_offset(
-        &self,
-        topic: String,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<Option<Offset>> {
-        let message = self
-            .read(
-                StorageKey::offset(&topic),
-                SequentialStore::address(),
-                network,
-            )
+        let value = T::default();
+        if storage
+            .compare_and_store(key, value.clone(), value.clone(), network)
             .await
-            .context("reading current offset")?;
-
-        if let KafkaPayload::ReadOk { value } = &message.body.payload {
-            return Ok(Some(*value));
-        }
-
-        Ok(None)
-    }
-
-    pub async fn read_or_create_offset(
-        &self,
-        topic: String,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<Offset> {
-        self.read_or_create(
-            StorageKey::offset(&topic),
-            SequentialStore::address(),
-            network,
-        )
-        .await
-    }
-
-    /// The stored offset is one greater than the latest entry.
-    pub async fn get_next_offset(
-        &self,
-        topic: String,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<Offset> {
-        *self.total_offset_writes.write().unwrap() += 1;
-        loop {
-            let current = self
-                .read_or_create_offset(topic.clone(), network)
-                .await
-                .context("reading current offset")?;
-            let next = current + 1;
-            if self
-                .write(
-                    StorageKey::offset(&topic),
-                    Some(current),
-                    next,
-                    SequentialStore::address(),
-                    network,
-                )
-                .await
-                .is_ok()
-            {
-                return Ok(current);
-            }
-
-            *self.cas_failures.write().unwrap() += 1;
-        }
-    }
-
-    pub async fn write_commit(
-        &self,
-        topic: String,
-        from: usize,
-        to: usize,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<()> {
-        let message = self.message(
-            SequentialStore::address(),
-            KafkaPayload::Cas {
-                key: StorageKey::commit(&topic),
-                from,
-                to,
-                create_if_not_exists: Some(true),
-            },
-        );
-        let event = network.request(message).await.context("cas for commit")?;
-        let Event::Message(message) = event else {
-            return Err(anyhow!("event not a message in cas response"));
-        };
-        let KafkaPayload::CasOk = message.body.payload else {
-            return Err(anyhow!("expected cas_ok, found {:?}", message.body.payload));
+            .is_ok()
+        {
+            return Ok(value);
         };
 
-        Ok(())
-    }
-
-    pub async fn read_log(
-        &mut self,
-        topic: String,
-        network: &Network<KafkaPayload>,
-        offset: Offset,
-    ) -> anyhow::Result<Option<Entry>> {
-        let cached = self.entries.entry(topic.clone()).or_default().get(&offset);
-        if let Some(entry) = cached {
-            return Ok(Some(*entry));
-        }
-
-        let response = self
-            .read(
-                StorageKey::log(&topic, offset),
-                LinearStore::address(),
-                network,
-            )
-            .await
-            .context("reading log entry")?;
-
-        match &response.body.payload {
-            KafkaPayload::ReadOk { value } => {
-                self.entries
-                    .entry(topic)
-                    .or_default()
-                    .insert(offset, *value);
-
-                Ok(Some(*value))
-            }
-            KafkaPayload::Error { .. } => Ok(None),
-            _ => panic!("expected read_ok, found {:?}", response.body.payload),
-        }
+        panic!("could not read or set value");
     }
 
     async fn append_entry(
         &mut self,
         topic: String,
         entry: Entry,
-        network: &Network<KafkaPayload>,
+        network: &Network,
     ) -> anyhow::Result<Offset> {
-        let offset = self
-            .get_next_offset(topic.clone(), network)
-            .await
-            .context("getting next available offset")?;
+        let key = StorageKey::log(&topic);
 
-        let key = StorageKey::log(&topic, offset);
-        let message = self.message(
-            LinearStore::address(),
-            KafkaPayload::Write { key, value: entry },
-        );
-        let response = network
-            .request(message)
-            .await
-            .context("adding entry to log")?;
+        *self.total_appends.write().unwrap() += 1;
+        loop {
+            let mut log = self
+                .read_or_create::<Log, _>(key.clone(), &self.linear_store, network)
+                .await
+                .context("reading log")?;
 
-        let Event::Message(message) = response else {
-            panic!("non-message event received in append");
-        };
+            let offset = log.len();
+            log.push(entry);
 
-        self.entries.entry(topic).or_default().insert(offset, entry);
+            if self
+                .linear_store
+                .compare_and_store(key.clone(), log[..log.len() - 1].to_vec(), log, network)
+                .await
+                .is_ok()
+            {
+                return Ok(offset);
+            }
 
-        if let KafkaPayload::WriteOk = message.body.payload {
-            return Ok(offset);
+            *self.cas_failures.write().unwrap() += 1;
         }
-
-        Err(anyhow!("appending failed"))
-    }
-
-    fn get_class(&self, topic: &str) -> usize {
-        topic.parse::<usize>().expect("topic was not uint") % self.n_classes
-    }
-
-    fn is_in_class(&self, topic: &str) -> bool {
-        let class = self.get_class(topic);
-        class == self.class_leader
-    }
-
-    async fn send_to_class_leader(
-        &mut self,
-        key: String,
-        msg: usize,
-        network: &Network<KafkaPayload>,
-    ) -> anyhow::Result<Offset> {
-        let class = self.get_class(&key);
-        let dst = format!("n{}", class);
-        let message = self.message(
-            dst,
-            KafkaPayload::Send {
-                key: key.clone(),
-                msg,
-            },
-        );
-        let response = network
-            .request(message)
-            .await
-            .context("requesting response from class leader")?;
-
-        let Event::Message(message) = response else {
-            return Err(anyhow!("class leader returned a bad event"));
-        };
-
-        if let KafkaPayload::SendOk { offset } = &message.body.payload {
-            self.entries.entry(key).or_default().insert(*offset, msg);
-            return Ok(*offset);
-        };
-
-        panic!("expected send_ok, found {:?}", message.body.payload)
     }
 }
 
 impl Drop for KafkaNode {
     fn drop(&mut self) {
         let cas_failures = *self.cas_failures.read().unwrap();
-        let total_appends = *self.total_offset_writes.read().unwrap();
+        let total_appends = *self.total_appends.read().unwrap();
         eprintln!(
-            "CAS FAILURES: {} / TOTAL OFFSET WRITES: {}",
+            "CAS FAILURES: {} / TOTAL APPENDS: {}",
             cas_failures, total_appends
         );
     }
@@ -425,39 +150,26 @@ impl Drop for KafkaNode {
 
 #[async_trait::async_trait]
 impl fly_io::Node<KafkaPayload> for KafkaNode {
-    fn from_init(
-        init: fly_io::protocol::Init,
-        _tx: std::sync::mpsc::Sender<fly_io::Event<KafkaPayload, ()>>,
-        _network: &mut Network<KafkaPayload>,
-    ) -> Self {
-        let class_leader = init
-            .node_ids
-            .iter()
-            .position(|nid| *nid == init.node_id)
-            .unwrap();
-        Self::new(init.node_id, class_leader, init.node_ids.len())
+    fn from_init(init: fly_io::protocol::Init, _network: &Network) -> Self {
+        Self::new(init.node_id)
     }
 
     async fn step(
         &mut self,
         event: Event<KafkaPayload, ()>,
-        network: &mut Network<KafkaPayload, ()>,
+        network: &Network,
     ) -> anyhow::Result<()> {
         match event {
-            Event::Injected(..) => {}
+            Event::Storage(_) => {}
+            Event::Injected(_) => {}
             Event::Message(message) => {
                 let mut reply = message.into_reply();
                 if let Some(payload) = match reply.body.payload {
                     KafkaPayload::Send { key, msg } => {
-                        let offset = if self.is_in_class(&key) {
-                            self.append_entry(key, msg, network)
-                                .await
-                                .context("adding message")?
-                        } else {
-                            self.send_to_class_leader(key, msg, network)
-                                .await
-                                .context("sending send request to class leader")?
-                        };
+                        let offset = self
+                            .append_entry(key, msg, network)
+                            .await
+                            .context("adding message")?;
 
                         Some(KafkaPayload::SendOk { offset })
                     }
@@ -465,80 +177,63 @@ impl fly_io::Node<KafkaPayload> for KafkaNode {
                     KafkaPayload::Poll { offsets } => {
                         let mut result = HashMap::new();
                         for (topic, requested_offset) in offsets.into_iter() {
-                            let current_offset = self
-                                .read_offset(topic.clone(), network)
+                            let Ok(log) = self
+                                .linear_store
+                                .read::<Log>(StorageKey::log(&topic), network)
                                 .await
-                                .context("reading current offset")?;
+                            else {
+                                continue;
+                            };
 
-                            if current_offset.is_none()
-                                || current_offset.unwrap() <= requested_offset
-                            {
+                            if log.len() <= requested_offset {
                                 continue;
                             }
 
-                            let mut offset = requested_offset;
-                            let mut entry = None;
-                            while entry.is_none() {
-                                entry = self
-                                    .read_log(topic.clone(), network, offset)
-                                    .await
-                                    .context("reading offset from log")?;
-
-                                // Maybe there's a better way to do this? Don't increment when entry
-                                // is valid because we need the correct offset value in the response.
-                                if entry.is_none() {
-                                    offset += 1;
-                                }
-                            }
+                            let n_logs = std::cmp::min(3, log.len() - requested_offset);
+                            let selected = log[requested_offset..requested_offset + n_logs]
+                                .iter()
+                                .cloned()
+                                .enumerate()
+                                .map(|(i, entry)| (requested_offset + i, entry))
+                                .collect::<Vec<_>>();
 
                             eprintln!(
-                                "topic={}, n_logs={}, start={}, offset={}, last_offset={:?}",
+                                "topic={}, n_logs={}, start={}, last_offset={:?}",
                                 topic.clone(),
                                 1,
                                 requested_offset,
-                                offset,
-                                offset // current_offset
+                                log.last()
                             );
 
-                            result.insert(topic, vec![(offset, entry.unwrap())]);
+                            result.insert(topic, selected);
                         }
                         Some(KafkaPayload::PollOk { msgs: result })
                     }
                     KafkaPayload::PollOk { .. } => None,
                     KafkaPayload::CommitOffsets { offsets } => {
-                        for (topic, offset_to_commit) in offsets.into_iter() {
-                            let current_commit = self
-                                .read_commit(topic.clone(), network)
-                                .await
-                                .context("reading current commit")?;
-                            if current_commit < offset_to_commit {
-                                self.write_commit(topic, current_commit, offset_to_commit, network)
-                                    .await
-                                    .context("writing new commit")?;
-                            }
-                        }
+                        self.sequential_store
+                            .write(StorageKey::commit(), offsets, network)?;
                         Some(KafkaPayload::CommitOffsetsOk)
                     }
                     KafkaPayload::CommitOffsetsOk => None,
                     KafkaPayload::ListCommittedOffsets { keys } => {
-                        let mut commits = HashMap::new();
-                        for key in keys.into_iter() {
-                            let commit = self
-                                .read_commit(key.clone(), network)
-                                .await
-                                .context("reading current commit")?;
-                            commits.insert(key, commit);
-                        }
+                        let commits = self
+                            .read_or_create::<CommitOffsets, _>(
+                                StorageKey::commit(),
+                                &self.sequential_store,
+                                network,
+                            )
+                            .await
+                            .context("reading commits")?;
+
+                        let commits = commits
+                            .into_iter()
+                            .filter(|(topic, _)| keys.contains(topic))
+                            .collect();
+
                         Some(KafkaPayload::ListCommittedOffsetsOk { offsets: commits })
                     }
                     KafkaPayload::ListCommittedOffsetsOk { .. } => None,
-                    KafkaPayload::Read { .. } => None,
-                    KafkaPayload::ReadOk { .. } => None,
-                    KafkaPayload::Write { .. } => None,
-                    KafkaPayload::WriteOk { .. } => None,
-                    KafkaPayload::Cas { .. } => None,
-                    KafkaPayload::CasOk { .. } => None,
-                    KafkaPayload::Error { .. } => None,
                 } {
                     reply.body.payload = payload;
                     network.send(reply).context("sending reply")?;
@@ -550,5 +245,5 @@ impl fly_io::Node<KafkaPayload> for KafkaNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    fly_io::server::Server::<KafkaPayload>::new().serve::<KafkaNode>()
+    fly_io::server::Server::new().serve::<KafkaNode, KafkaPayload>()
 }

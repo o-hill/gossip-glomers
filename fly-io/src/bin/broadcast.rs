@@ -5,11 +5,11 @@ use std::{
 };
 
 use anyhow::Context;
-use fly_io::protocol::{Body, Message};
+use fly_io::{network::Network, Body, Event, Message};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 enum InjectedPayload {
     Gossip,
 }
@@ -47,15 +47,12 @@ struct BroadcastNode {
 impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
     fn from_init(
         init: fly_io::protocol::Init,
-        tx: std::sync::mpsc::Sender<fly_io::Event<BroadcastPayload, InjectedPayload>>,
-        _network: &mut fly_io::network::Network<BroadcastPayload, InjectedPayload>,
+        network: &fly_io::network::Network<InjectedPayload>,
     ) -> Self {
+        let net = network.clone();
         std::thread::spawn(move || loop {
             std::thread::sleep(Duration::from_millis(450));
-            if tx
-                .send(fly_io::Event::Injected(InjectedPayload::Gossip))
-                .is_err()
-            {
+            if net.inject(InjectedPayload::Gossip).is_err() {
                 break;
             }
         });
@@ -81,9 +78,10 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
     async fn step(
         &mut self,
         input: fly_io::Event<BroadcastPayload, InjectedPayload>,
-        network: &mut fly_io::network::Network<BroadcastPayload, InjectedPayload>,
+        network: &Network<InjectedPayload>,
     ) -> anyhow::Result<()> {
         match input {
+            Event::Storage(_) => {}
             fly_io::Event::Injected(event) => match event {
                 InjectedPayload::Gossip => {
                     for neighbor in &self.neighborhood {
@@ -162,5 +160,5 @@ impl fly_io::Node<BroadcastPayload, InjectedPayload> for BroadcastNode {
 }
 
 fn main() -> anyhow::Result<()> {
-    fly_io::server::Server::<BroadcastPayload, InjectedPayload>::new().serve::<BroadcastNode>()
+    fly_io::server::Server::<InjectedPayload>::new().serve::<BroadcastNode, BroadcastPayload>()
 }

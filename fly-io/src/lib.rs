@@ -1,6 +1,6 @@
 use protocol::{UntypedBody, UntypedMessage};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
-use service::{LinearStore, SequentialStore, StoragePayload};
+use service::{StoragePayload, STORAGE_ADDRESSES};
 
 pub mod network;
 pub mod protocol;
@@ -96,17 +96,16 @@ where
     P: DeserializeOwned,
 {
     fn from(value: NetworkEvent<IP>) -> Self {
-        let storage_addresses = [SequentialStore::address(), LinearStore::address()];
         match value {
             NetworkEvent::Message(untyped) => {
-                if storage_addresses.contains(&untyped.dst)
-                    || storage_addresses.contains(&untyped.src)
+                if STORAGE_ADDRESSES.contains(&untyped.dst.as_str())
+                    || STORAGE_ADDRESSES.contains(&untyped.src.as_str())
                 {
                     let typed: Message<StoragePayload> = Message::from(untyped);
                     return Event::Storage(typed);
                 }
                 let typed: Message<P> = Message::from(untyped);
-                return Event::Message(typed);
+                Event::Message(typed)
             }
             NetworkEvent::Injected(payload) => Event::Injected(payload),
         }
@@ -120,11 +119,11 @@ where
 {
     fn from_init(
         init: crate::protocol::Init,
-        network: &mut crate::network::Network<InjectedPayload>,
+        network: &crate::network::Network<InjectedPayload>,
     ) -> Self;
     async fn step(
         &mut self,
         event: Event<Payload, InjectedPayload>,
-        network: &mut crate::network::Network<InjectedPayload>,
+        network: &crate::network::Network<InjectedPayload>,
     ) -> anyhow::Result<()>;
 }

@@ -1,5 +1,8 @@
 use anyhow::Context;
-use fly_io::{network::Network, service::SequentialStore};
+use fly_io::{
+    network::Network,
+    service::{SequentialStore, Storage},
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -14,7 +17,6 @@ enum CounterPayload {
 
 #[derive(Debug, Clone)]
 struct CounterNode {
-    node_id: String,
     storage: SequentialStore,
 }
 
@@ -25,7 +27,7 @@ impl CounterNode {
 
     pub async fn add_to_current_value(
         &self,
-        network: &mut Network,
+        network: &Network,
         delta: usize,
     ) -> anyhow::Result<usize> {
         let mut new_value: usize;
@@ -52,9 +54,8 @@ impl CounterNode {
 
 #[async_trait::async_trait]
 impl fly_io::Node<CounterPayload> for CounterNode {
-    fn from_init(init: fly_io::protocol::Init, network: &mut Network) -> Self {
+    fn from_init(init: fly_io::protocol::Init, network: &Network) -> Self {
         let result = Self {
-            node_id: init.node_id.clone(),
             storage: SequentialStore::new(init.node_id),
         };
 
@@ -69,7 +70,7 @@ impl fly_io::Node<CounterPayload> for CounterNode {
     async fn step(
         &mut self,
         event: fly_io::Event<CounterPayload>,
-        network: &mut Network,
+        network: &Network,
     ) -> anyhow::Result<()> {
         match event {
             fly_io::Event::Storage(_) => {}
